@@ -9,6 +9,8 @@ Usage:
   python brave_web_ai_bridge.py ask --target okmd --model deepseek --msg-file "prompt.txt" --out-file "okmd_reply.md"
   python brave_web_ai_bridge.py ask --target aipass --model "Claude Opus 5" --msg-file "prompt.txt" --out-file "aipass_reply.md"
   python brave_web_ai_bridge.py ask --target copilot --room "9a3189f1" --msg-file "prompt.txt" --out-file "copilot_reply.md"
+
+Exit codes: 0 = response captured, 1 = connection/injection/response failure or timeout.
 """
 
 import argparse
@@ -22,12 +24,49 @@ import websockets
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+CDP_CMD_TIMEOUT = 30  # seconds to wait for a single CDP command response
+TAB_OPEN_WAIT = 4     # seconds to wait after opening a new browser tab
+POLL_INTERVAL = 4     # seconds between response polling cycles
+STABLE_CYCLES = 3     # consecutive stable polls before considering the response finished
+MIN_RESPONSE_CHARS = 300
+
+
+class BridgeError(RuntimeError):
+    """Raised when a CDP command or in-page script fails."""
+
+
+# Per-target configuration. Adding a new platform = adding one entry here
+# plus an inject_script() branch (adapter split is planned for Phase 2).
+TARGETS = {
+    "copilot": {
+        "url_match": "m365.cloud.microsoft",
+        "home_url": "https://m365.cloud.microsoft/chat",
+        "room_url_template": "https://m365.cloud.microsoft/chat/conversation/{room}",
+        # Prefer the conversation panel; falls back to document.body
+        "content_selectors": ["#m365-chat-main-panel", "main"],
+    },
+    "okmd": {
+        "url_match": "okmd.or.th",
+        "home_url": "https://playground.okmd.or.th/chat",
+        "room_url_template": None,
+        "content_selectors": ["div.chatbody", "main"],
+    },
+    "aipass": {
+        "url_match": "aipass.net",
+        "home_url": "https://de.aipass.net/chat",
+        "room_url_template": None,
+        "content_selectors": ["main"],
+    },
+}
+
 
 class BraveCdpClient:
     def __init__(self, cdp_url="http://127.0.0.1:9222"):
         self.cdp_url = cdp_url
         self.ws = None
         self.req_id = 0
+        self._pending = {}  # cmd id -> Future
+        self._reader_task = None
 
     async def get_or_create_tab(self, target_type: str, room_identifier: str = ""):
         try:
@@ -35,6 +74,8 @@ class BraveCdpClient:
         except Exception as e:
             print(f"[!] Error: Cannot connect to Brave on port 9222. Ensure Brave is running ({e})")
             sys.exit(1)
+
+        cfg = TARGETS[target_type]
 
         # Match existing page tab (ignore iframes and service workers)
         matched_tab = None
@@ -47,48 +88,68 @@ class BraveCdpClient:
             if target_type == "copilot":
                 if room_identifier and (room_identifier in url or room_identifier in title):
                     return t
-                elif "m365.cloud.microsoft" in url:
+                elif cfg["url_match"] in url:
                     matched_tab = t
-            elif target_type == "okmd" and "okmd.or.th" in url:
-                return t
-            elif target_type == "aipass" and "aipass.net" in url:
+            elif cfg["url_match"] in url:
                 return t
 
         if matched_tab:
-            # If target is copilot with specific room and URL does not match room, navigate
-            if target_type == "copilot" and room_identifier and room_identifier not in matched_tab.get("url", ""):
-                target_url = room_identifier if room_identifier.startswith("http") else f"https://m365.cloud.microsoft/chat/conversation/{room_identifier}"
-                print(f"[INFO] Navigating existing Copilot tab to room: {target_url}")
-                requests.get(f"{self.cdp_url}/json/activate/{matched_tab.get('id')}", timeout=5)
+            # Room request but the open tab points elsewhere: the caller
+            # navigates later over WebSocket (see execute_bridge), since the
+            # HTTP endpoint cannot navigate an existing tab.
             return matched_tab
 
-        # If not open, open new tab
+        # If not open, open new tab via the CDP HTTP endpoint (PUT is required
+        # by newer Chrome/Brave versions).
         print(f"[INFO] Tab for {target_type} not open. Creating new tab via CDP...")
-        nav_url = "https://playground.okmd.or.th/chat"
-        if target_type == "aipass":
-            nav_url = "https://de.aipass.net/chat"
-        elif target_type == "copilot":
-            nav_url = room_identifier if room_identifier.startswith("http") else (
-                f"https://m365.cloud.microsoft/chat/conversation/{room_identifier}" if room_identifier else "https://m365.cloud.microsoft/chat"
-            )
+        if target_type == "copilot" and room_identifier:
+            nav_url = room_identifier if room_identifier.startswith("http") else cfg["room_url_template"].format(room=room_identifier)
+        else:
+            nav_url = cfg["home_url"]
 
         new_tab = requests.put(f"{self.cdp_url}/json/new?{nav_url}", timeout=5).json()
-        await asyncio.sleep(4)
+        await asyncio.sleep(TAB_OPEN_WAIT)
         return new_tab
+
+    def room_url(self, target_type: str, room_identifier: str) -> str:
+        cfg = TARGETS[target_type]
+        if room_identifier.startswith("http"):
+            return room_identifier
+        return cfg["room_url_template"].format(room=room_identifier) if cfg["room_url_template"] else cfg["home_url"]
 
     async def connect_ws(self, ws_url: str):
         self.ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
+        self._reader_task = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self):
+        """Route incoming CDP messages: responses resolve pending futures."""
+        try:
+            async for raw in self.ws:
+                try:
+                    data = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                fut = self._pending.pop(data.get("id"), None)
+                if fut and not fut.done():
+                    fut.set_result(data)
+        except Exception as e:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(e)
+            self._pending.clear()
 
     async def send_cmd(self, method: str, params: dict = None):
+        if self.ws is None:
+            raise BridgeError("WebSocket not connected")
         self.req_id += 1
         curr_id = self.req_id
-        req = json.dumps({"id": curr_id, "method": method, "params": params or {}})
-        await self.ws.send(req)
-        while True:
-            resp = await self.ws.recv()
-            data = json.loads(resp)
-            if data.get("id") == curr_id:
-                return data.get("result", {})
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[curr_id] = fut
+        await self.ws.send(json.dumps({"id": curr_id, "method": method, "params": params or {}}))
+        data = await asyncio.wait_for(fut, timeout=CDP_CMD_TIMEOUT)
+        if "error" in data:
+            raise BridgeError(f"CDP error from {method}: {data['error']}")
+        return data.get("result", {})
 
     async def eval_js(self, expression: str):
         res = await self.send_cmd("Runtime.evaluate", {
@@ -96,11 +157,14 @@ class BraveCdpClient:
             "returnByValue": True,
             "awaitPromise": True
         })
-        val = res.get("result", {}).get("value")
-        return val
+        inner = res.get("result", {})
+        if inner.get("exceptionDetails"):
+            desc = inner["exceptionDetails"].get("exception", {}).get("description", "unknown JS error")
+            raise BridgeError(f"In-page script failed: {desc}")
+        return inner.get("value")
 
     async def press_enter(self):
-        # Hardware key down and up via CDP
+        # Hardware key down and up via CDP (bypasses synthetic-event blocking)
         await self.send_cmd("Input.dispatchKeyEvent", {
             "type": "rawKeyDown",
             "windowsVirtualKeyCode": 13,
@@ -115,31 +179,20 @@ class BraveCdpClient:
         })
 
     async def close(self):
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
         if self.ws:
             await self.ws.close()
+            self.ws = None
 
 
-async def execute_bridge(target: str, message: str, out_file: str, model: str = "", room_id: str = "", timeout_sec: int = 240):
-    client = BraveCdpClient()
-    tab = await client.get_or_create_tab(target, room_id)
-    ws_url = tab.get("webSocketDebuggerUrl")
-    if not ws_url:
-        print(f"[!] No webSocketDebuggerUrl found for tab: {tab}")
-        sys.exit(1)
-
-    print(f"[OK] Connecting via WebSocket CDP to [{target.upper()}]: {tab.get('title')}", flush=True)
-    await client.connect_ws(ws_url)
-
-    # Bring tab to front
-    await client.send_cmd("Page.bringToFront")
-    await asyncio.sleep(0.5)
-
+def build_inject_script(target: str, message: str, model: str) -> str:
     escaped_msg = json.dumps(message)
     escaped_model = json.dumps(model)
 
     if target == "okmd":
-        print(f"[1] OKMD: Configuring model '{model or 'default'}' & injecting prompt...", flush=True)
-        inject_script = f"""
+        return f"""
         (() => {{
             const targetModel = {escaped_model}.trim().toLowerCase();
 
@@ -176,7 +229,7 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
             ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
 
             setTimeout(() => {{
-                const sendBtn = document.querySelector('button.btn-sent-message') || 
+                const sendBtn = document.querySelector('button.btn-sent-message') ||
                                 Array.from(document.querySelectorAll('button')).find(b => b.querySelector('svg') && !b.innerText && b.type !== 'button') ||
                                 document.querySelector('button[type="submit"]');
                 if (sendBtn) sendBtn.click();
@@ -185,12 +238,9 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
             return {{ success: true }};
         }})()
         """
-        res = await client.eval_js(inject_script)
-        print(f"[2] Injection result: {res}", flush=True)
 
-    elif target == "aipass":
-        print(f"[1] AIPass: Selecting model '{model or 'Claude Opus 5'}' & injecting prompt...", flush=True)
-        inject_script = f"""
+    if target == "aipass":
+        return f"""
         (() => {{
             const targetModel = ({escaped_model} || 'Claude Opus 5').trim().toLowerCase();
 
@@ -226,12 +276,9 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
             return {{ success: true }};
         }})()
         """
-        res = await client.eval_js(inject_script)
-        print(f"[2] Injection result: {res}", flush=True)
 
-    elif target == "copilot":
-        print("[1] Copilot: Targeting editor & injecting prompt via document.execCommand...", flush=True)
-        inject_script = f"""
+    # copilot
+    return f"""
         (() => {{
             const inputEl = document.querySelector("#m365-chat-editor-target-element") ||
                             document.querySelector("span[aria-label*='Copilot'], span[aria-label*='ส่งข้อความ'], div[contenteditable='true'], [role='textbox']");
@@ -259,21 +306,77 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
             return {{ success: true, clickedBtn: clicked, targetTag: inputEl.tagName }};
         }})()
         """
-        res = await client.eval_js(inject_script)
-        print(f"[2] Injection result: {res}", flush=True)
 
+
+def build_content_reader_script(target: str) -> str:
+    """Read the response text. Copilot isolates the latest AI message
+    (selectors from HANDOFF_TO_ZAI.md); other targets prefer the conversation
+    panel and fall back to the whole body."""
+    if target == "copilot":
+        return """
+        (() => {
+            const aiMsgs = document.querySelectorAll(".fai-AiMessage, [data-content='ai-message'], [class*='AiResponse']");
+            if (aiMsgs.length > 0) return aiMsgs[aiMsgs.length - 1].innerText;
+            const el = document.querySelector("#m365-chat-main-panel, main");
+            return (el || document.body).innerText;
+        })()
+        """
+    selectors = TARGETS[target]["content_selectors"]
+    selector_list = json.dumps(", ".join(selectors))
+    return f"""
+    (() => {{
+        const el = document.querySelector({selector_list});
+        return (el || document.body).innerText;
+    }})()
+    """
+
+
+async def execute_bridge(target: str, message: str, out_file: str, model: str = "", room_id: str = "", timeout_sec: int = 240) -> bool:
+    client = BraveCdpClient()
+    tab = await client.get_or_create_tab(target, room_id)
+    ws_url = tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        print(f"[!] No webSocketDebuggerUrl found for tab: {tab}")
+        sys.exit(1)
+
+    print(f"[OK] Connecting via WebSocket CDP to [{target.upper()}]: {tab.get('title')}", flush=True)
+    await client.connect_ws(ws_url)
+
+    # Navigate an existing tab to the requested room if it points elsewhere
+    if target == "copilot" and room_id and room_id not in tab.get("url", ""):
+        room_url = client.room_url(target, room_id)
+        print(f"[INFO] Navigating existing Copilot tab to room: {room_url}")
+        await client.send_cmd("Page.navigate", {"url": room_url})
+        await asyncio.sleep(3)
+
+    # Bring tab to front
+    await client.send_cmd("Page.bringToFront")
+    await asyncio.sleep(0.5)
+
+    print(f"[1] Injecting prompt into [{target.upper()}]" + (f" (model '{model}')" if model else "") + "...", flush=True)
+    res = await client.eval_js(build_inject_script(target, message, model))
+    print(f"[2] Injection result: {res}", flush=True)
+    if not res or not res.get("success"):
+        error = (res or {}).get("error", "in-page script returned no result")
+        print(f"[!] Injection failed: {error}")
+        await client.close()
+        return False
+
+    if target == "copilot":
         await asyncio.sleep(0.5)
         await client.press_enter()
 
     print(f"[3] Prompt sent to [{target.upper()}]. Monitoring response...", flush=True)
 
+    content_script = build_content_reader_script(target)
     prev_len = 0
     stable_count = 0
     start = time.time()
     snippet = message[:35].strip()
+    finished = False
 
     while time.time() - start < timeout_sec:
-        await asyncio.sleep(4)
+        await asyncio.sleep(POLL_INTERVAL)
 
         await client.eval_js("""
         (() => {
@@ -283,21 +386,10 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
         })()
         """)
 
-        # Extract AI response
-        if target == "copilot":
-            ai_text = await client.eval_js("""
-            (() => {
-                const aiMsgs = Array.from(document.querySelectorAll(".fai-AiMessage, [data-content='ai-message'], [class*='AiResponse']"));
-                if (aiMsgs.length > 0) {
-                    return aiMsgs[aiMsgs.length - 1].innerText;
-                }
-                return "";
-            })()
-            """) or ""
-            text = ai_text if ai_text.strip() else (await client.eval_js("document.body.innerText") or "")
-        else:
-            text = await client.eval_js("document.body.innerText") or ""
+        text = await client.eval_js(content_script) or ""
 
+        # Copilot reads the isolated AI message, so trimming the prompt
+        # snippet off the front is neither needed nor safe
         if snippet and target != "copilot":
             idx = text.rfind(snippet)
             if idx != -1:
@@ -306,25 +398,30 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
         cur_len = len(text)
         print(f"  Streaming {target} response: {cur_len} chars...", flush=True)
 
-        if cur_len > 300 and cur_len == prev_len:
+        if cur_len > MIN_RESPONSE_CHARS and cur_len == prev_len:
             stable_count += 1
-            if stable_count >= 3:
+            if stable_count >= STABLE_CYCLES:
                 print(f"\n[OK] {target.upper()} response finished & stabilized ({cur_len} chars)!", flush=True)
                 with open(out_file, "w", encoding="utf-8") as f:
                     f.write(text)
                 print(f"[OK] Successfully saved response to {out_file}")
+                finished = True
                 break
         else:
             stable_count = 0
             prev_len = cur_len
 
+    if not finished:
+        print(f"[!] Timeout after {timeout_sec}s: response did not stabilize. No output written to {out_file}")
+
     await client.close()
+    return finished
 
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Brave Web AI Bridge CLI (WebSocket CDP)")
     parser.add_argument("action", choices=["ask", "send", "read"])
-    parser.add_argument("--target", choices=["copilot", "okmd", "aipass"], default="copilot", help="Target Web AI platform")
+    parser.add_argument("--target", choices=list(TARGETS), default="copilot", help="Target Web AI platform")
     parser.add_argument("--model", default="", help="Specific AI Model to select (e.g. deepseek, claude, gemini, openai)")
     parser.add_argument("--room", default="", help="Room URL or conversation ID (for Copilot)")
     parser.add_argument("--msg-file", required=True, help="Path to prompt file")
@@ -336,7 +433,9 @@ def main():
     with open(args.msg_file, "r", encoding="utf-8") as f:
         msg = f.read()
 
-    asyncio.run(execute_bridge(args.target, msg, args.out_file, model=args.model, room_id=args.room, timeout_sec=args.timeout))
+    ok = asyncio.run(execute_bridge(args.target, msg, args.out_file, model=args.model, room_id=args.room, timeout_sec=args.timeout))
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
