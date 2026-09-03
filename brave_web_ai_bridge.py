@@ -315,7 +315,7 @@ def build_content_reader_script(target: str) -> str:
     if target == "copilot":
         return """
         (() => {
-            const aiMsgs = document.querySelectorAll(".fai-AiMessage, [data-content='ai-message'], [class*='AiResponse']");
+            const aiMsgs = document.querySelectorAll(".fai-CopilotMessage__content, .fai-CopilotMessage, .fai-AiMessage, [data-content='ai-message'], [class*='AiResponse']");
             if (aiMsgs.length > 0) return aiMsgs[aiMsgs.length - 1].innerText;
             const el = document.querySelector("#m365-chat-main-panel, main");
             return (el || document.body).innerText;
@@ -364,6 +364,14 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
 
     if target == "copilot":
         await asyncio.sleep(0.5)
+        await client.eval_js("""
+        (() => {
+            const btn = document.querySelector("button.fai-SendButton") ||
+                        document.querySelector("button[aria-label='Send']") ||
+                        document.querySelector("button[aria-label*='ส่ง']");
+            if (btn && !btn.disabled) btn.click();
+        })()
+        """)
         await client.press_enter()
 
     print(f"[3] Prompt sent to [{target.upper()}]. Monitoring response...", flush=True)
