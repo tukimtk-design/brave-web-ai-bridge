@@ -8,3 +8,5 @@ node_modules/
 dist/
 *.log
 scratch/
+state/model_status.json
+aipass-auto-router-source/

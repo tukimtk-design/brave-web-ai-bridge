@@ -10,7 +10,7 @@ from brave_web_ai_bridge import main
 @patch('brave_web_ai_bridge.execute_bridge', new_callable=AsyncMock)
 def test_cli_args_parsing_details(mock_execute_bridge, mock_file):
     main()
-    mock_execute_bridge.assert_called_once_with('okmd', 'Hello AI', 'okmd_reply.md', model='deepseek', room_id='', timeout_sec=240)
+    mock_execute_bridge.assert_called_once_with('okmd', 'Hello AI', 'okmd_reply.md', model='deepseek', room_id='', timeout_sec=240, task_class='')
 
 @pytest.mark.asyncio
 @patch('brave_web_ai_bridge.requests.get')
