@@ -243,11 +243,14 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
             inputEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
 
             let clicked = false;
-            const allBtns = Array.from(document.querySelectorAll('button'));
-            const submitBtn = allBtns.find(b => {{
-                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                return (aria.includes('ส่ง') || aria.includes('send') || aria.includes('submit')) && !b.disabled;
-            }});
+            const submitBtn = document.querySelector("button.fai-SendButton") ||
+                            document.querySelector("button[type='submit'][aria-label='ส่ง']") ||
+                            document.querySelector("button[type='submit'][sendicon]") ||
+                            document.querySelector("button[aria-label='ส่ง']") ||
+                            Array.from(document.querySelectorAll('button')).find(b => {{
+                                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                                return (aria.includes('ส่ง') || aria.includes('send')) && !b.disabled;
+                            }});
             if (submitBtn) {{
                 submitBtn.click();
                 clicked = true;
@@ -280,9 +283,22 @@ async def execute_bridge(target: str, message: str, out_file: str, model: str = 
         })()
         """)
 
-        text = await client.eval_js("document.body.innerText") or ""
+        # Extract AI response
+        if target == "copilot":
+            ai_text = await client.eval_js("""
+            (() => {
+                const aiMsgs = Array.from(document.querySelectorAll(".fai-AiMessage, [data-content='ai-message'], [class*='AiResponse']"));
+                if (aiMsgs.length > 0) {
+                    return aiMsgs[aiMsgs.length - 1].innerText;
+                }
+                return "";
+            })()
+            """) or ""
+            text = ai_text if ai_text.strip() else (await client.eval_js("document.body.innerText") or "")
+        else:
+            text = await client.eval_js("document.body.innerText") or ""
 
-        if snippet:
+        if snippet and target != "copilot":
             idx = text.rfind(snippet)
             if idx != -1:
                 text = text[idx:]
