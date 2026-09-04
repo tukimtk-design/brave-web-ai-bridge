@@ -17,16 +17,19 @@ async def bridge_ops(action: str, params: dict | None = None) -> str:
         params = {}
     return await dispatch_action(action, params)
 
+@mcp_server.tool(description="[DEPRECATED: Use bridge_ops with action='ping'] Returns CDP 9222 status without making AI queries.")
 def bridge_ping() -> str:
     """Returns CDP 9222 status without making AI queries. Kept for backwards compatibility."""
     result = handle_ping()
     return result["message"]
 
+@mcp_server.tool(description="[DEPRECATED: Use bridge_ops with action='list_targets'] Lists active Web AI tabs matching allowed targets.")
 def bridge_list_targets() -> list[str]:
     """Lists active Web AI tabs matching allowed targets. Kept for backwards compatibility."""
     result = handle_list_targets()
     return result["targets"]
 
+@mcp_server.tool(description="[DEPRECATED: Use bridge_ops with action='ask'] Sends a prompt to the specified target and returns the response.")
 async def bridge_ask(
     target: str,
     prompt: str,
