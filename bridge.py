@@ -1,4 +1,4 @@
-from brave_web_ai_bridge import BraveCdpClient, execute_bridge, main
+from brave_web_ai_bridge import main
 
 if __name__ == "__main__":
     main()
