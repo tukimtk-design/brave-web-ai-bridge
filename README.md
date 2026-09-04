@@ -46,9 +46,10 @@ python mcp_server.py
 ```
 
 ### Available MCP Tools:
-- **`bridge_ping`**: Confirms connection to the Brave Browser on port 9222 without triggering any AI queries.
-- **`bridge_list_targets`**: Lists the supported Web AI endpoints (e.g., `copilot`, `okmd`, `aipass`).
-- **`bridge_ask`**: Submits a prompt to an AI target (`target`, `prompt`, `room_id`, `max_output_chars`, `timeout_seconds`, `new_session`). The AI response is read securely from the browser tab and returned directly to the MCP client.
+- **`bridge_ops`** (Adaptive Single-Gateway Standard): Exposes a single comprehensive tool for all interactions. Use the parameter `action: "list_actions"` to self-discover all supported commands:
+  - `ping`: Confirms connection to the Brave Browser on port 9222 without triggering any AI queries.
+  - `list_targets`: Lists the supported Web AI endpoints (e.g., `copilot`, `okmd`, `aipass`).
+  - `ask`: Submits a prompt to an AI target. Requires `params: {"target": "...", "prompt": "..."}`. Returns response string with detailed telemetry.
 
 ---
 

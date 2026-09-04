@@ -1,34 +1,32 @@
 import logging
-import os
 import sys
-import tempfile
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
-from brave_web_ai_bridge import TARGETS, execute_bridge
+from actions import dispatch_action, handle_ask, handle_list_targets, handle_ping
 
 # Ensure all logging goes to stderr so stdout is strictly for JSON-RPC
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="[%(levelname)s] %(message)s")
 
 mcp_server = FastMCP("brave_web_ai_bridge")
 
-@mcp_server.tool()
+@mcp_server.tool(name="bridge_ops", description="Adaptive Single-Gateway for Brave Web AI Bridge operations. Use action 'list_actions' to discover available commands, or specify action and params to execute.")
+async def bridge_ops(action: str, params: dict | None = None) -> str:
+    """Adaptive Single-Gateway for Brave Web AI Bridge operations. Use action 'list_actions' to discover available commands, or specify action and params to execute."""
+    if params is None:
+        params = {}
+    return await dispatch_action(action, params)
+
 def bridge_ping() -> str:
-    """Returns CDP 9222 status without making AI queries."""
-    try:
-        resp = requests.get("http://127.0.0.1:9222/json", timeout=2)
-        resp.raise_for_status()
-        return f"CDP 9222 status: OK (Found {len(resp.json())} targets)"
-    except Exception as e:
-        return f"CDP 9222 status: Error ({e})"
+    """Returns CDP 9222 status without making AI queries. Kept for backwards compatibility."""
+    result = handle_ping()
+    return result["message"]
 
-@mcp_server.tool()
 def bridge_list_targets() -> list[str]:
-    """Lists active Web AI tabs matching allowed targets."""
-    return list(TARGETS.keys())
+    """Lists active Web AI tabs matching allowed targets. Kept for backwards compatibility."""
+    result = handle_list_targets()
+    return result["targets"]
 
-@mcp_server.tool()
 async def bridge_ask(
     target: str,
     prompt: str,
@@ -37,41 +35,19 @@ async def bridge_ask(
     timeout_seconds: int = 240,
     new_session: bool = False
 ) -> str:
-    """Sends a prompt to the specified target and returns the response."""
-    if target not in TARGETS:
-        return f"Error: Target '{target}' not supported. Supported: {list(TARGETS.keys())}"
-
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as pf:
-        pf.write(prompt)
-        prompt_file = pf.name
-
-    out_file = prompt_file.replace(".txt", "_out.txt")
-
-    try:
-        success = await execute_bridge(
-            target=target,
-            message=prompt,
-            out_file=out_file,
-            room_id=room_id,
-            timeout_sec=timeout_seconds,
-            new_session=new_session
-        )
-        if not success:
-            return "Error: execution failed or timed out."
-
-        if os.path.exists(out_file):
-            with open(out_file, "r", encoding="utf-8") as f:
-                content = f.read()
-            if max_output_chars > 0 and len(content) > max_output_chars:
-                content = content[:max_output_chars]
-            return content
-        else:
-            return "Error: response file not found."
-    finally:
-        if os.path.exists(prompt_file):
-            os.remove(prompt_file)
-        if os.path.exists(out_file):
-            os.remove(out_file)
+    """Sends a prompt to the specified target and returns the response. Kept for backwards compatibility."""
+    params = {
+        "target": target,
+        "prompt": prompt,
+        "room_id": room_id,
+        "max_output_chars": max_output_chars,
+        "timeout_seconds": timeout_seconds,
+        "new_session": new_session
+    }
+    result = await handle_ask(params)
+    if "error" in result:
+        return result["message"]
+    return result["response"]
 
 def main():
     mcp_server.run()
