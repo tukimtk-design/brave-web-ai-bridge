@@ -340,8 +340,6 @@ def build_content_reader_script(target: str) -> str:
     }})()
     """
 
-
-<<<<<<< HEAD
 class AipassAdapter:
     """AIPass reliability layer, ported from aipass-auto-router Phase 2
     (Reliability Hardening). Uses the shared BraveCdpClient as transport —
