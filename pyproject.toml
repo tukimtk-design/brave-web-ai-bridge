@@ -1,0 +1,12 @@
+[project]
+name = "brave-web-ai-bridge"
+version = "0.1.0"
+description = "Brave Web AI Bridge CLI and MCP Server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "websockets",
+    "mcp",
+    "anyio"
+]

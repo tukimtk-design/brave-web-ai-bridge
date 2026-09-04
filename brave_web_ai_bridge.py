@@ -18,6 +18,7 @@ import asyncio
 import json
 import sys
 import time
+
 import requests
 import websockets
 
@@ -138,7 +139,7 @@ class BraveCdpClient:
                     fut.set_exception(e)
             self._pending.clear()
 
-    async def send_cmd(self, method: str, params: dict = None):
+    async def send_cmd(self, method: str, params: dict | None = None):
         if self.ws is None:
             raise BridgeError("WebSocket not connected")
         self.req_id += 1
@@ -331,7 +332,7 @@ def build_content_reader_script(target: str) -> str:
     """
 
 
-async def execute_bridge(target: str, message: str, out_file: str, model: str = "", room_id: str = "", timeout_sec: int = 240) -> bool:
+async def execute_bridge(target: str, message: str, out_file: str, model: str = "", room_id: str = "", timeout_sec: int = 240, new_session: bool = False) -> bool:
     client = BraveCdpClient()
     tab = await client.get_or_create_tab(target, room_id)
     ws_url = tab.get("webSocketDebuggerUrl")
